@@ -1068,6 +1068,18 @@ const NOSEWHEEL = 0.35, GROUND_RUDDER = 0.2, GROUND_WEATHERVANE = 0.3; // rad/s:
 // touchdown: the wings settle level on the gear (rad/s cap) and the tyres scrub off any sideways
 // drift (1/s) instead of both snapping to zero in one frame
 const SETTLE_ROLL_RATE = 0.25, TYRE_GRIP = 4;
+// terrain: you can land on ground up to MAX_LAND_SLOPE and roll on up to MAX_TAXI_SLOPE (rad);
+// anything steeper is flying into the hillside / tipping over
+const MAX_LAND_SLOPE = 0.14, MAX_TAXI_SLOPE = 0.26;
+// slope of the ground under (x, z): gradient (dh/dx, dh/dz) and overall steepness, rad
+const _slope = { sx: 0, sz: 0, steep: 0 };
+function slopeAt(x, z) {
+  const d = 2;
+  _slope.sx = (groundHeight(x + d, z) - groundHeight(x - d, z)) / (2 * d);
+  _slope.sz = (groundHeight(x, z + d) - groundHeight(x, z - d)) / (2 * d);
+  _slope.steep = Math.atan(Math.hypot(_slope.sx, _slope.sz));
+  return _slope;
+}
 const FLAP_VMAX = 56;      // ≈ 110 kt
 const GEAR = 1.6 + RWY_TOP;
 const FLAP_DEG = [0, 15, 30];
@@ -1103,7 +1115,7 @@ const S = {
   pos: new THREE.Vector3(), quat: new THREE.Quaternion(), vel: new THREE.Vector3(), vAir: new THREE.Vector3(),
   speed: 0, gs: 0, throttle: 0, rpm: 0, grounded: true, heading: 0, gPitch: 0, crashed: false, crashT: 0,
   gearDown: true, gearPos: 1, flapSet: 0, flapPos: 0, stalling: false, alpha: 0, beta: 0, gamma: 0, vDot: 0, trim: 0,
-  parkBrake: false, tas: 0, sigma: 1, q: 0, r: 0, rRud: 0, pDih: 0, gRoll: 0, gSide: 0, // pitch rate, yaw rate, sideslip-induced roll rate (rad/s)
+  parkBrake: false, tas: 0, sigma: 1, q: 0, r: 0, rRud: 0, pDih: 0, gRoll: 0, gSide: 0, tPitch: 0, tRoll: 0, // tPitch/tRoll: terrain tilt under the wheels // pitch rate, yaw rate, sideslip-induced roll rate (rad/s)
   baro: 1013.25, // altimeter setting, hPa
 };
 const ctl = { pitch: 0, roll: 0, yaw: 0 };
@@ -1172,7 +1184,7 @@ const $ = (id) => document.getElementById(id);
 function showMsg(text, secs = 2.5) { $('msg').textContent = text; msgTimer = secs; }
 
 function reset(air) {
-  S.crashed = false; S.heading = 0; S.gPitch = 0; S.stalling = false; S.gs = 0; S.beta = 0; S.gamma = 0; S.vDot = 0; S.trim = TRIM_TO; S.q = 0; S.r = 0; S.rRud = 0; S.pDih = 0; S.gRoll = 0; S.gSide = 0;
+  S.crashed = false; S.heading = 0; S.gPitch = 0; S.stalling = false; S.gs = 0; S.beta = 0; S.gamma = 0; S.vDot = 0; S.trim = TRIM_TO; S.q = 0; S.r = 0; S.rRud = 0; S.pDih = 0; S.tPitch = 0; S.tRoll = 0; S.gRoll = 0; S.gSide = 0;
   S.gearDown = true; S.gearPos = 1;
   S.baro = weather.qnh; // as if you'd just listened to the ATIS
   plane.g.visible = true; fire.visible = smoke.visible = false;
@@ -1279,7 +1291,7 @@ function step(dt) {
     _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
     // wheels resist until thrust/wind beat rolling friction
     const resist = ROLL_FRICTION + Math.max(held('brakes'), S.parkBrake ? 1 : 0) * BRAKE;
-    let acc = thrustAt(S.throttle * enginePower(sig), Math.max(air, 0)) - drag * sig * air * Math.abs(air);
+    let acc = thrustAt(S.throttle * enginePower(sig), Math.max(air, 0)) - drag * sig * air * Math.abs(air) - G * Math.sin(S.tPitch);
     acc = S.gs > 0 ? acc - resist : Math.max(0, acc - resist);
     S.gs = Math.max(0, S.gs + acc * dt);
     S.tas = Math.max(0, air);
@@ -1298,12 +1310,18 @@ function step(dt) {
     S.q = (S.gPitch - gp0) / dt;
     S.alpha = S.gPitch;
     S.gRoll = approach(S.gRoll, damp(S.gRoll, 0, 6, dt), SETTLE_ROLL_RATE * dt); // wings settle level
-    S.quat.setFromEuler(_e.set(S.gPitch, S.heading, S.gRoll, 'YXZ'));
     right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));
     S.vel.copy(_h).multiplyScalar(S.gs).addScaledVector(right, S.gSide);
     S.pos.addScaledVector(S.vel, dt);
     const gh = groundHeight(S.pos.x, S.pos.z);
     if (gh < 0.3) return crash('rolled into the water');
+    const sl = slopeAt(S.pos.x, S.pos.z);
+    if (sl.steep > MAX_TAXI_SLOPE) return crash('tipped over on steep ground');
+    // sit on the slope: nose up going uphill, the high side's wing up
+    S.tPitch = damp(S.tPitch, Math.atan(sl.sx * _h.x + sl.sz * _h.z), 10, dt);
+    S.tRoll = damp(S.tRoll, Math.atan(sl.sx * right.x + sl.sz * right.z), 10, dt);
+    S.quat.setFromEuler(_e.set(S.gPitch + S.tPitch, S.heading, S.gRoll + S.tRoll, 'YXZ'));
+    S.vel.y = (gh + GEAR - S.pos.y) / dt;                   // following the ground up and down
     S.pos.y = gh + GEAR;
     // lift off once the wing carries the weight
     // (with the same ground-effect boost the wing gets just after lift-off, so there's no jump in lift)
@@ -1388,9 +1406,17 @@ function step(dt) {
     if (gh < 0.3) return crash('ditched in the water');
     if (S.gearPos < 1) return crash(S.gearPos === 0 ? 'landed with the gear up' : 'gear not locked down');
     _e.setFromQuaternion(S.quat, 'YXZ');
-    const pitch = _e.x, roll = _e.z, vs = S.vel.y;
+    const sl = slopeAt(S.pos.x, S.pos.z);
+    _h.set(-Math.sin(_e.y), 0, -Math.cos(_e.y));
+    right.set(Math.cos(_e.y), 0, -Math.sin(_e.y));
+    const tPitch = Math.atan(sl.sx * _h.x + sl.sz * _h.z), tRoll = Math.atan(sl.sx * right.x + sl.sz * right.z);
+    // speed into the surface (along its normal), and attitude relative to it
+    const n = _v.set(-sl.sx, 1, -sl.sz).normalize(), vs = Math.min(S.vel.dot(n), 0);
+    const pitch = _e.x - tPitch, roll = _e.z - tRoll;
+    if (sl.steep > MAX_LAND_SLOPE) return crash('flew into terrain');
     if (vs > -7 && Math.abs(roll) < 0.35 && pitch > -0.12 && pitch < 0.35) {
       S.grounded = true; S.stalling = false; S.heading = _e.y; S.gPitch = Math.max(0, pitch);
+      S.tPitch = tPitch; S.tRoll = tRoll;
       S.pos.y = gh + GEAR;
       _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
       right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));

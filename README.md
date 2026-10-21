@@ -45,9 +45,15 @@ in your browser (localStorage) only.
 
 ## What's in it
 
-- **Flight model:** lift-based with angle-of-attack stability, trim, flaps (with balloon), ground
-  effect, propeller thrust that falls with airspeed, pitch/yaw inertia, crosswind weathervaning on
-  the ground and in the air, stalls.
+- **Two flight models** (Settings → Flight model):
+  - *Standard* (default, forgiving): lift-based with angle-of-attack stability, trim, flaps (with
+    balloon), ground effect, propeller thrust that falls with airspeed, pitch/yaw inertia, crosswind
+    weathervaning, gentle stalls.
+  - *Realistic* (6-DOF): a rigid body with Cessna-172-class mass, inertia and stability/control
+    derivatives; elevator/aileron/rudder deflections, adverse yaw, rudder-induced roll, a real
+    phugoid, 160 hp engine with propeller torque, P-factor and slipstream (right rudder on takeoff),
+    rotation when the elevator beats the nose-wheel load, wing drop at the stall and spins. About
+    680 fpm climb at 77 kt, ~120 kt cruise.
 - **Atmosphere:** temperature lapse rate, QNH, air density (lift, drag and engine power), IAS vs
   TAS, density altitude, altimeter temperature error.
 - **Weather:** presets (ISA, VFR, NPA, CAT I–III) or custom visibility, cumulus or overcast layers,

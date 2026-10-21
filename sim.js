@@ -1115,7 +1115,7 @@ const S = {
   pos: new THREE.Vector3(), quat: new THREE.Quaternion(), vel: new THREE.Vector3(), vAir: new THREE.Vector3(),
   speed: 0, gs: 0, throttle: 0, rpm: 0, grounded: true, heading: 0, gPitch: 0, crashed: false, crashT: 0,
   gearDown: true, gearPos: 1, flapSet: 0, flapPos: 0, stalling: false, alpha: 0, beta: 0, gamma: 0, vDot: 0, trim: 0,
-  parkBrake: false, tas: 0, sigma: 1, q: 0, r: 0, rRud: 0, pDih: 0, gRoll: 0, gSide: 0, tPitch: 0, tRoll: 0, // tPitch/tRoll: terrain tilt under the wheels // pitch rate, yaw rate, sideslip-induced roll rate (rad/s)
+  parkBrake: false, tas: 0, sigma: 1, q: 0, r: 0, rRud: 0, pDih: 0, pR: 0, qR: 0, rR: 0, alphaDot: 0, // pR/qR/rR: realistic-model body rates gRoll: 0, gSide: 0, tPitch: 0, tRoll: 0, // tPitch/tRoll: terrain tilt under the wheels // pitch rate, yaw rate, sideslip-induced roll rate (rad/s)
   baro: 1013.25, // altimeter setting, hPa
 };
 const ctl = { pitch: 0, roll: 0, yaw: 0 };
@@ -1184,7 +1184,7 @@ const $ = (id) => document.getElementById(id);
 function showMsg(text, secs = 2.5) { $('msg').textContent = text; msgTimer = secs; }
 
 function reset(air) {
-  S.crashed = false; S.heading = 0; S.gPitch = 0; S.stalling = false; S.gs = 0; S.beta = 0; S.gamma = 0; S.vDot = 0; S.trim = TRIM_TO; S.q = 0; S.r = 0; S.rRud = 0; S.pDih = 0; S.tPitch = 0; S.tRoll = 0; S.gRoll = 0; S.gSide = 0;
+  S.crashed = false; S.heading = 0; S.gPitch = 0; S.stalling = false; S.gs = 0; S.beta = 0; S.gamma = 0; S.vDot = 0; S.trim = TRIM_TO; S.q = 0; S.r = 0; S.rRud = 0; S.pDih = 0; S.pR = S.qR = S.rR = 0; S.alphaDot = 0; S.tPitch = 0; S.tRoll = 0; S.gRoll = 0; S.gSide = 0;
   S.gearDown = true; S.gearPos = 1;
   S.baro = weather.qnh; // as if you'd just listened to the ATIS
   plane.g.visible = true; fire.visible = smoke.visible = false;
@@ -1193,6 +1193,7 @@ function reset(air) {
     const z = RWY_HL - 300 + 3000, gamma = -3 * D2R;
     S.pos.set(0, Math.max(RH + GEAR + 157, groundHeight(0, z) + 120), z);
     S.speed = 37; S.throttle = 0.37; S.grounded = false;
+    if (flightModel === 'realistic') { S.throttle = 0.2; S.trim = 0.09; } // less drag: less power, approach trim
     S.flapSet = 1; S.flapPos = 0.5;
     S.vAir.set(0, Math.sin(gamma), -Math.cos(gamma)).multiplyScalar(S.speed / Math.sqrt(densityRatio(S.pos.y)));
     S.gamma = gamma;
@@ -1228,113 +1229,121 @@ const fwd = new THREE.Vector3(), up = new THREE.Vector3(), right = new THREE.Vec
 
 function rotLocal(axis, angle) { S.quat.multiply(_q.setFromAxisAngle(axis, angle)); }
 
-function step(dt) {
-  if (!(dt > 0)) return; // first frame can report 0 s; rate terms below divide by dt
-  updateWind(dt);
-  S.rpm = damp(S.rpm, S.crashed ? 0 : 0.12 + 0.88 * S.throttle, 1.5, dt);
+// ---------- realistic flight model (6-DOF) ----------
+// Picked in Settings ('realistic'; the default 'standard' model above is forgiving and idealised).
+// A rigid body with mass and inertia: aerodynamic forces and moments come from stability and
+// control derivatives of a Cessna-172-class aircraft, the controls are surface deflections, and the
+// engine is a 160 hp piston with a fixed-pitch propeller. Body axes: x forward, y right, z down;
+// p, q, r = roll (right wing down +), pitch (nose up +), yaw (nose right +) rates.
+let flightModel = 'standard';
+const R = {
+  S: 16.2, b: 11.0, c: 1.49, rho0: 1.225,                 // wing area m², span m, chord m
+  Ixx: 1285, Iyy: 1825, Izz: 2667,                         // kg·m²
+  CD0: 0.027, CD_GEAR: 0.012, CD_FLAP: 0.05, K: 0.053,     // drag: clean, gear down, full flaps, induced
+  CLq: 3.9, CLde: 0.43,
+  CYb: -0.39, CYdr: 0.19,
+  Clb: -0.092, Clp: -0.48, Clr: 0.08, Clda: 0.15, Cldr: 0.015,
+  Cm0: 0, Cma: -1.8, Cmq: -12.4, Cmad: -5.2, Cmde: -1.28, CmFlap: 0,
+  Cnb: 0.059, Cnp: -0.028, Cnr: -0.094, Cnda: -0.022, Cndr: -0.065,
+  DE_UP: 0.49, DE_DN: 0.40, DA: 0.30, DR: 0.28,            // max deflections, rad
+  KEY_ELEVATOR: 0.6, KEY_PITCH_RATE: 0.8,                  // a held pitch key: share of elevator travel, and how fast it gets there (1/s)
+  P: 119e3, ETA: 0.8, T0_PER_W: 0.0195, PROP_R: 0.95, PROP_W: 251, // engine W, prop efficiency, static N/W, prop radius m, rad/s
+  ZT: 0.25,                                                // thrust line below the CG, m: power pitches the nose up
+  PF_ARM: 0.1,                                             // P-factor / slipstream yaw arm, m
+  X_MAIN: 0.3,                                             // main wheels behind the CG, m
+  PF_GROUND: 0.05,                                         // left swing on the takeoff roll at full power, rad/s
+  RIG_POWER: 0.65, RIG_PF: 420,                            // rigging: torque and P-factor cancel at cruise (≈65% power, 115 kt)
+  TORQUE_SHARE: 0.2,                                       // share of the engine torque that reaches the airframe as roll
+};
+R.m = 0.5 * R.rho0 * R.S / K_LIFT;                          // ≈ 1024 kg, consistent with the standard model
+R.Imain = R.Iyy + R.m * R.X_MAIN * R.X_MAIN;                 // pitch inertia about the main wheels
+const realThrust = (throttle, V, sig) => {                  // N: static thrust, blending into η·P/V at speed
+  const P = R.P * enginePower(sig) * throttle;
+  if (P < 1) return 0;
+  const T0 = R.T0_PER_W * P, Tv = R.ETA * P / Math.max(V, 1);
+  return Math.pow(T0 ** -4 + Tv ** -4, -0.25);              // smooth minimum of the two
+};
+const realCD = (CL, ge) => R.CD0 + R.CD_GEAR * S.gearPos + R.CD_FLAP * S.flapPos + R.K * CL * CL * (1 - GE_DRAG * ge);
+// slipstream: the prop wash adds dynamic pressure over the tail, so the elevator and rudder work at
+// low speed with power on
+const tailQ = (qbar, T) => qbar + 0.6 * T / (2 * Math.PI * R.PROP_R * R.PROP_R);
+// trim sets the elevator that holds the trimmed angle of attack (S.trim keeps its meaning in both models)
+const elevator = () => clamp(-(R.Cm0 + R.Cma * (ALPHA_TRIM + S.trim)) / R.Cmde - ctl.pitch * R.KEY_ELEVATOR * (ctl.pitch > 0 ? R.DE_UP : R.DE_DN), -R.DE_UP, R.DE_DN);
+const _w = new THREE.Vector3();
 
-  if (S.crashed) {
-    S.crashT += dt;
-    const t = S.crashT;
-    fire.scale.setScalar(2 + Math.min(t, 1) * 22);
-    fire.material.opacity = Math.max(0, 1 - t / 1.6);
-    fire.visible = fire.material.opacity > 0;
-    smoke.scale.setScalar(4 + t * 10);
-    smoke.position.y = S.pos.y + t * 8;
-    smoke.material.opacity = Math.max(0, 0.75 - t / 8);
-    return;
+function airRealistic(dt) {
+  up.set(0, 1, 0).applyQuaternion(S.quat);
+  right.set(1, 0, 0).applyQuaternion(S.quat);
+  if (S.vAir.lengthSq() < 0.01) S.vAir.copy(fwd).multiplyScalar(0.1);
+  const V = S.vAir.length(), Vn = Math.max(V, 5);
+  _vhat.copy(S.vAir).divideScalar(V);
+  const u = S.vAir.dot(fwd), v = S.vAir.dot(right), w = -S.vAir.dot(up);
+  const alpha = Math.atan2(w, u), beta = Math.asin(clamp(v / V, -1, 1));
+  S.alphaDot = damp(S.alphaDot, clamp((alpha - S.alpha) / dt, -2, 2), 20, dt);
+  S.alpha = alpha; S.beta = beta;
+  const sig = S.sigma = densityRatio(S.pos.y), rs = Math.sqrt(sig);
+  const qbar = 0.5 * R.rho0 * sig * V * V;
+  const ph = S.pR * R.b / (2 * Vn), qh = S.qR * R.c / (2 * Vn), rh = S.rR * R.b / (2 * Vn), adh = S.alphaDot * R.c / (2 * Vn);
+  const de = elevator(), da = ctl.roll * R.DA, dr = -ctl.yaw * R.DR;
+  const wingH = S.pos.y - GEAR + 1.6 - Math.max(groundHeight(S.pos.x, S.pos.z), 0);
+  const ge = Math.exp(-Math.max(wingH, 0) / GE_HEIGHT);
+  const stall = smoothstep(alpha, ALPHA_STALL - 0.02, ALPHA_STALL + 0.08); // 0 below the stall → 1 well past it
+
+  const CL = liftCoef(alpha, S.flapPos) * (1 + GE_LIFT * ge) + R.CLq * qh + R.CLde * de;
+  const CD = realCD(CL, ge) + 1.0 * stall * Math.sin(alpha) ** 2;
+  const CY = R.CYb * beta + R.CYdr * dr;
+  // past the stall the roll damping reverses (the downgoing wing stalls deeper): that's what drives a
+  // spin; one wing also tends to drop first
+  const Cl = R.Clb * beta + R.Clp * (1 - 1.2 * stall) * ph + R.Clr * rh + R.Clda * da * (1 - 0.5 * stall) + R.Cldr * dr
+    + stall * 0.015 * (2 * noise(simTime * 0.6, 21.7) - 1);
+  const Cm = R.Cm0 + R.Cma * alpha + R.Cmq * qh + R.Cmad * adh + R.CmFlap * S.flapPos;
+  const Cn = R.Cnb * beta + R.Cnp * ph + R.Cnr * rh + R.Cnda * da;
+
+  const T = realThrust(S.throttle, V, sig), qt = tailQ(qbar, T);
+  // prop torque and P-factor / slipstream: the airframe is rigged to cancel them at cruise power, so
+  // they show at high power and low speed (takeoff, climb, go-around): roll and yaw to the left
+  const Lm = qbar * R.S * R.b * Cl - R.TORQUE_SHARE * (S.throttle * enginePower(sig) - R.RIG_POWER) * R.P / R.PROP_W;
+  const Mm = qbar * R.S * R.c * Cm + qt * R.S * R.c * R.Cmde * de + T * R.ZT;
+  const Nm = qbar * R.S * R.b * Cn + qt * R.S * R.b * R.Cndr * dr
+    - R.PF_ARM * (T * (clamp(alpha * 3, 0, 1) + 25 / (V + 25)) - R.RIG_PF);
+  const p = S.pR, q = S.qR, r = S.rR;
+  S.pR += (Lm - (R.Izz - R.Iyy) * q * r) / R.Ixx * dt;
+  S.qR += (Mm - (R.Ixx - R.Izz) * p * r) / R.Iyy * dt;
+  S.rR += (Nm - (R.Iyy - R.Ixx) * p * q) / R.Izz * dt;
+
+  // turbulence: gusts nudge the rates and the vertical air
+  const { inside } = layerFactors(S.pos.y);
+  const turb = Math.max(0, weather.gustKt - weather.windKt) * 0.012 + weather.windKt * 0.002 + inside * 0.12;
+  if (turb > 0) {
+    S.pR += (noise(simTime * 1.7, 3.1) - 0.5) * turb * 20 * dt;
+    S.qR += (noise(simTime * 1.3, 5.9) - 0.5) * turb * 6 * dt;
+    S.vAir.y += (noise(simTime * 0.9, 9.2) - 0.5) * turb * 40 * dt;
   }
+  // body rates → rotation in three.js body axes (x right, y up, z back)
+  _w.set(S.qR, -S.rR, -S.pR);
+  const ang = _w.length() * dt;
+  if (ang > 0) S.quat.multiply(_q.setFromAxisAngle(_w.normalize(), ang)).normalize();
+  S.q = S.qR;
 
-  if (held('throttleUp')) S.throttle += 0.5 * dt;
-  if (held('throttleDown')) S.throttle -= 0.5 * dt;
-  S.throttle = clamp(S.throttle, 0, 1);
-
-  let tp = held('pitchUp') - held('pitchDown');
-  if (invert) tp = -tp;
-  const tr = held('rollRight') - held('rollLeft');
-  const ty = held('yawRight') - held('yawLeft');
-  if (held('trimUp')) S.trim = Math.min(TRIM_UP, S.trim + TRIM_RATE * dt);
-  if (held('trimDown')) S.trim = Math.max(TRIM_DOWN, S.trim - TRIM_RATE * dt);
-  // the elevator follows the keys quickly but eases back when they're released, so a tap holds a flare
-  ctl.pitch = damp(ctl.pitch, tp, Math.abs(tp) > Math.abs(ctl.pitch) || tp * ctl.pitch < 0 ? 3 : 1.2, dt);
-  ctl.roll = damp(ctl.roll, tr, 6, dt);
-  ctl.yaw = damp(ctl.yaw, ty, S.grounded ? 2.5 : 4, dt); // gentler on the ground: less twitchy steering
-
-  // gear (4 s travel) and flaps (3 s full travel)
-  const gearTarget = S.gearDown ? 1 : 0;
-  if (S.gearPos !== gearTarget) {
-    S.gearPos = approach(S.gearPos, gearTarget, dt / 4);
-    if (S.gearPos === gearTarget) playSound('clunk');
-  }
-  S.flapPos = approach(S.flapPos, S.flapSet / 2, dt / 3);
-  const drag = DRAG * (1 + 0.9 * S.flapPos - 0.3 * (1 - S.gearPos));
-
-  fwd.set(0, 0, -1).applyQuaternion(S.quat);
-
-  if (S.grounded) {
-    S.stalling = false;
-    _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
-    right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));
-    // airflow over the plane: crosswind makes a sideslip the fin turns into, more so as the air gets faster
-    S.gSide = damp(S.gSide, 0, TYRE_GRIP, dt);             // tyres scrub off sideways drift
-    _v.copy(_h).multiplyScalar(S.gs).addScaledVector(right, S.gSide).sub(windVel);
-    const air = _v.dot(_h), side = _v.dot(right);
-    const sig = S.sigma = densityRatio(S.pos.y), rs = Math.sqrt(sig);
-    const airV = Math.hypot(air, side);
-    const auth = clamp(airV * rs / 40, 0, 1);
-    S.beta = airV > 1 ? clamp(Math.atan2(side, Math.max(air, 0.5)), -0.6, 0.6) : 0;
-    // rudder pedals steer the nose wheel (fades as the wheel unloads with speed) and the rudder bites the air
-    const wheel = NOSEWHEEL * Math.min(1, S.gs / 5) / (1 + S.gs / 15) * (S.gPitch > 0.03 ? 0 : 1);
-    const dHdg = -(ctl.yaw * (wheel + GROUND_RUDDER * auth) + GROUND_WEATHERVANE * S.beta * auth * Math.min(1, S.gs / 3));
-    S.heading += dHdg * dt;
-    S.r = dHdg; S.pDih = 0;                   // carried into the air at lift-off
-    _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
-    // wheels resist until thrust/wind beat rolling friction
-    const resist = ROLL_FRICTION + Math.max(held('brakes'), S.parkBrake ? 1 : 0) * BRAKE;
-    let acc = thrustAt(S.throttle * enginePower(sig), Math.max(air, 0)) - drag * sig * air * Math.abs(air) - G * Math.sin(S.tPitch);
-    acc = S.gs > 0 ? acc - resist : Math.max(0, acc - resist);
-    S.gs = Math.max(0, S.gs + acc * dt);
-    S.tas = Math.max(0, air);
-    const ias = S.tas * rs; // indicated
-    S.vDot = damp(S.vDot, (ias - S.speed) / dt, 3, dt);
-    S.speed = ias;
-
-    // the nose wants the same α as in flight (trim, power, flaps, stick); the elevator only has the
-    // authority to lift the nose wheel as the airspeed builds, and the tail limits it
-    const alphaCmd = ALPHA_TRIM + S.trim + ALPHA_FLAP * S.flapPos + ALPHA_POWER * S.throttle + ctl.pitch * ALPHA_STICK + Math.min(0.06 * S.vDot, 0.02); // same as in the air
-    const lift = smoothstep(S.speed, ROTATE - 10 - 4 * S.flapPos, ROTATE - 4 * S.flapPos);
-    const pitchTarget = clamp(alphaCmd * lift, 0, 0.2);
-    // nose wheel lifts / lowers smoothly, no faster than ROTATE_RATE; the rate carries into the air
-    const gp0 = S.gPitch;
-    S.gPitch = approach(S.gPitch, damp(S.gPitch, pitchTarget, 2, dt), ROTATE_RATE * dt);
-    S.q = (S.gPitch - gp0) / dt;
-    S.alpha = S.gPitch;
-    S.gRoll = approach(S.gRoll, damp(S.gRoll, 0, 6, dt), SETTLE_ROLL_RATE * dt); // wings settle level
-    right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));
-    S.vel.copy(_h).multiplyScalar(S.gs).addScaledVector(right, S.gSide);
-    S.pos.addScaledVector(S.vel, dt);
-    const gh = groundHeight(S.pos.x, S.pos.z);
-    if (gh < 0.3) return crash('rolled into the water');
-    const sl = slopeAt(S.pos.x, S.pos.z);
-    if (sl.steep > MAX_TAXI_SLOPE) return crash('tipped over on steep ground');
-    // sit on the slope: nose up going uphill, the high side's wing up
-    S.tPitch = damp(S.tPitch, Math.atan(sl.sx * _h.x + sl.sz * _h.z), 10, dt);
-    S.tRoll = damp(S.tRoll, Math.atan(sl.sx * right.x + sl.sz * right.z), 10, dt);
-    S.quat.setFromEuler(_e.set(S.gPitch + S.tPitch, S.heading, S.gRoll + S.tRoll, 'YXZ'));
-    S.vel.y = (gh + GEAR - S.pos.y) / dt;                   // following the ground up and down
-    S.pos.y = gh + GEAR;
-    // lift off once the wing carries the weight
-    // (with the same ground-effect boost the wing gets just after lift-off, so there's no jump in lift)
-    const geLift = 1 + GE_LIFT * Math.exp(-1.6 / GE_HEIGHT);
-    if (K_LIFT * S.speed * S.speed * liftCoef(S.gPitch, S.flapPos) * geLift > G) {
-      S.grounded = false; S.gamma = 0; S.pos.y += 0.002; // 2 mm clear of the runway: invisible, but not 'touching'
-      S.vAir.copy(S.vel).sub(windVel);
-      showMsg('Airborne!', 1.5);
-    }
-    return;
-  }
-
-  // ---- airborne ----
+  // forces, as accelerations
+  const k = qbar * R.S / R.m;
+  _liftDir.crossVectors(right, _vhat).normalize();
+  _acc.copy(fwd).multiplyScalar(T / R.m)
+    .addScaledVector(_liftDir, k * CL)
+    .addScaledVector(_vhat, -k * CD)
+    .addScaledVector(right, k * CY);
+  _acc.y -= G;
+  S.vAir.addScaledVector(_acc, dt);
+  S.tas = S.vAir.length();
+  const ias = S.tas * rs;
+  S.vDot = damp(S.vDot, (ias - S.speed) / dt, 3, dt);
+  S.speed = ias;
+  S.gamma = Math.asin(clamp(_vhat.y, -1, 1));
+  S.stalling = alpha > ALPHA_STALL - 0.035;
+  S.vel.copy(S.vAir).add(windVel);
+  S.pos.addScaledVector(S.vel, dt);
+}
+function airStandard(dt, drag) {
   up.set(0, 1, 0).applyQuaternion(S.quat);
   right.set(1, 0, 0).applyQuaternion(S.quat);
   if (S.vAir.lengthSq() < 0.01) S.vAir.copy(fwd).multiplyScalar(0.1);
@@ -1400,6 +1409,154 @@ function step(dt) {
 
   S.vel.copy(S.vAir).add(windVel);
   S.pos.addScaledVector(S.vel, dt);
+}
+
+function setFlightModel(m) {
+  if (m === flightModel) return;
+  // carry the rotation rates across so a mid-air switch is smooth
+  if (m === 'realistic') { S.pR = 0; S.qR = S.q; S.rR = -S.r; }
+  else { S.q = S.qR; S.r = -S.rR; S.rRud = 0; S.pDih = 0; }
+  flightModel = m;
+}
+
+function step(dt) {
+  if (!(dt > 0)) return; // first frame can report 0 s; rate terms below divide by dt
+  updateWind(dt);
+  S.rpm = damp(S.rpm, S.crashed ? 0 : 0.12 + 0.88 * S.throttle, 1.5, dt);
+
+  if (S.crashed) {
+    S.crashT += dt;
+    const t = S.crashT;
+    fire.scale.setScalar(2 + Math.min(t, 1) * 22);
+    fire.material.opacity = Math.max(0, 1 - t / 1.6);
+    fire.visible = fire.material.opacity > 0;
+    smoke.scale.setScalar(4 + t * 10);
+    smoke.position.y = S.pos.y + t * 8;
+    smoke.material.opacity = Math.max(0, 0.75 - t / 8);
+    return;
+  }
+
+  if (held('throttleUp')) S.throttle += 0.5 * dt;
+  if (held('throttleDown')) S.throttle -= 0.5 * dt;
+  S.throttle = clamp(S.throttle, 0, 1);
+
+  let tp = held('pitchUp') - held('pitchDown');
+  if (invert) tp = -tp;
+  const tr = held('rollRight') - held('rollLeft');
+  const ty = held('yawRight') - held('yawLeft');
+  if (held('trimUp')) S.trim = Math.min(TRIM_UP, S.trim + TRIM_RATE * dt);
+  if (held('trimDown')) S.trim = Math.max(TRIM_DOWN, S.trim - TRIM_RATE * dt);
+  // the elevator follows the keys quickly but eases back when they're released, so a tap holds a flare
+  if (flightModel === 'realistic') {
+    // realistic: the elevator moves at a yoke-like rate, so a tap is a small correction and holding
+    // the key eases in the full pull
+    ctl.pitch = approach(ctl.pitch, tp, (Math.abs(tp) > Math.abs(ctl.pitch) || tp * ctl.pitch < 0 ? R.KEY_PITCH_RATE : 1.2) * dt);
+  } else ctl.pitch = damp(ctl.pitch, tp, Math.abs(tp) > Math.abs(ctl.pitch) || tp * ctl.pitch < 0 ? 3 : 1.2, dt);
+  ctl.roll = damp(ctl.roll, tr, 6, dt);
+  ctl.yaw = damp(ctl.yaw, ty, S.grounded ? 2.5 : 4, dt); // gentler on the ground: less twitchy steering
+
+  // gear (4 s travel) and flaps (3 s full travel)
+  const gearTarget = S.gearDown ? 1 : 0;
+  if (S.gearPos !== gearTarget) {
+    S.gearPos = approach(S.gearPos, gearTarget, dt / 4);
+    if (S.gearPos === gearTarget) playSound('clunk');
+  }
+  S.flapPos = approach(S.flapPos, S.flapSet / 2, dt / 3);
+  const drag = DRAG * (1 + 0.9 * S.flapPos - 0.3 * (1 - S.gearPos));
+
+  fwd.set(0, 0, -1).applyQuaternion(S.quat);
+
+  if (S.grounded) {
+    S.stalling = false;
+    _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
+    right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));
+    // airflow over the plane: crosswind makes a sideslip the fin turns into, more so as the air gets faster
+    S.gSide = damp(S.gSide, 0, TYRE_GRIP, dt);             // tyres scrub off sideways drift
+    _v.copy(_h).multiplyScalar(S.gs).addScaledVector(right, S.gSide).sub(windVel);
+    const air = _v.dot(_h), side = _v.dot(right);
+    const sig = S.sigma = densityRatio(S.pos.y), rs = Math.sqrt(sig);
+    const airV = Math.hypot(air, side);
+    const auth = clamp(airV * rs / 40, 0, 1);
+    S.beta = airV > 1 ? clamp(Math.atan2(side, Math.max(air, 0.5)), -0.6, 0.6) : 0;
+    // rudder pedals steer the nose wheel (fades as the wheel unloads with speed) and the rudder bites the air
+    const wheel = NOSEWHEEL * Math.min(1, S.gs / 5) / (1 + S.gs / 15) * (S.gPitch > 0.03 ? 0 : 1);
+    const real = flightModel === 'realistic';
+    // (realistic: prop wash gives the rudder some bite even when slow, and torque / P-factor /
+    // slipstream swing the nose left at high power, so you need right rudder on the takeoff roll)
+    const rudAuth = real ? clamp((airV * rs + 12 * S.throttle) / 40, 0, 1) : auth;
+    const dHdg = -(ctl.yaw * (wheel + GROUND_RUDDER * rudAuth) + GROUND_WEATHERVANE * S.beta * auth * Math.min(1, S.gs / 3))
+      + (real ? R.PF_GROUND * S.throttle * (1 - 0.6 * clamp(airV * rs / 35, 0, 1)) : 0);
+    S.heading += dHdg * dt;
+    S.r = dHdg; S.pDih = 0;                   // carried into the air at lift-off
+    _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
+    // wheels resist until thrust/wind beat rolling friction
+    const resist = ROLL_FRICTION + Math.max(held('brakes'), S.parkBrake ? 1 : 0) * BRAKE;
+    let acc = (real
+      ? realThrust(S.throttle, air, sig) / R.m - K_LIFT * sig * air * Math.abs(air) * realCD(0, 0)
+      : thrustAt(S.throttle * enginePower(sig), Math.max(air, 0)) - drag * sig * air * Math.abs(air)) - G * Math.sin(S.tPitch);
+    acc = S.gs > 0 ? acc - resist : Math.max(0, acc - resist);
+    S.gs = Math.max(0, S.gs + acc * dt);
+    S.tas = Math.max(0, air);
+    const ias = S.tas * rs; // indicated
+    S.vDot = damp(S.vDot, (ias - S.speed) / dt, 3, dt);
+    S.speed = ias;
+
+    // the nose wants the same α as in flight (trim, power, flaps, stick); the elevator only has the
+    // authority to lift the nose wheel as the airspeed builds, and the tail limits it
+    if (real) {
+      // realistic: pitch about the main wheels. The elevator (and the trim, power and wing pitching
+      // moments) must beat the weight on the nose wheel before the nose lifts; tail strike at 12°
+      const qbar = 0.5 * R.rho0 * sig * air * Math.abs(air), T = realThrust(S.throttle, air, sig);
+      const ge0 = Math.exp(-1.6 / GE_HEIGHT), Lift = qbar * R.S * liftCoef(S.gPitch, S.flapPos) * (1 + GE_LIFT * ge0);
+      const M = qbar * R.S * R.c * (R.Cm0 + R.Cma * S.gPitch + R.CmFlap * S.flapPos + R.Cmq * S.qR * R.c / (2 * Math.max(air, 5)))
+        + tailQ(qbar, T) * R.S * R.c * R.Cmde * elevator() + T * R.ZT + (Lift - R.m * G) * R.X_MAIN;
+      if (S.gPitch <= 0 && M <= 0) { S.gPitch = 0; S.qR = 0; }
+      else {
+        S.qR += M / R.Imain * dt;
+        S.gPitch += S.qR * dt;
+        if (S.gPitch < 0) { S.gPitch = 0; S.qR = 0; }                       // nose wheel back down
+        if (S.gPitch > 0.21) { S.gPitch = 0.21; S.qR = Math.min(S.qR, 0); }  // tail on the runway
+      }
+      S.q = S.qR;
+    } else {
+      const alphaCmd = ALPHA_TRIM + S.trim + ALPHA_FLAP * S.flapPos + ALPHA_POWER * S.throttle + ctl.pitch * ALPHA_STICK + Math.min(0.06 * S.vDot, 0.02); // same as in the air
+      const lift = smoothstep(S.speed, ROTATE - 10 - 4 * S.flapPos, ROTATE - 4 * S.flapPos);
+      const pitchTarget = clamp(alphaCmd * lift, 0, 0.2);
+      // nose wheel lifts / lowers smoothly, no faster than ROTATE_RATE; the rate carries into the air
+      const gp0 = S.gPitch;
+      S.gPitch = approach(S.gPitch, damp(S.gPitch, pitchTarget, 2, dt), ROTATE_RATE * dt);
+      S.q = (S.gPitch - gp0) / dt;
+    }
+    S.alpha = S.gPitch;
+    S.gRoll = approach(S.gRoll, damp(S.gRoll, 0, 6, dt), SETTLE_ROLL_RATE * dt); // wings settle level
+    right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));
+    S.vel.copy(_h).multiplyScalar(S.gs).addScaledVector(right, S.gSide);
+    S.pos.addScaledVector(S.vel, dt);
+    const gh = groundHeight(S.pos.x, S.pos.z);
+    if (gh < 0.3) return crash('rolled into the water');
+    const sl = slopeAt(S.pos.x, S.pos.z);
+    if (sl.steep > MAX_TAXI_SLOPE) return crash('tipped over on steep ground');
+    // sit on the slope: nose up going uphill, the high side's wing up
+    S.tPitch = damp(S.tPitch, Math.atan(sl.sx * _h.x + sl.sz * _h.z), 10, dt);
+    S.tRoll = damp(S.tRoll, Math.atan(sl.sx * right.x + sl.sz * right.z), 10, dt);
+    S.quat.setFromEuler(_e.set(S.gPitch + S.tPitch, S.heading, S.gRoll + S.tRoll, 'YXZ'));
+    S.vel.y = (gh + GEAR - S.pos.y) / dt;                   // following the ground up and down
+    S.pos.y = gh + GEAR;
+    // lift off once the wing carries the weight
+    // (with the same ground-effect boost the wing gets just after lift-off, so there's no jump in lift)
+    const geLift = 1 + GE_LIFT * Math.exp(-1.6 / GE_HEIGHT);
+    if (K_LIFT * S.speed * S.speed * liftCoef(S.gPitch, S.flapPos) * geLift > G) {
+      S.grounded = false; S.gamma = 0; S.pos.y += 0.002; // 2 mm clear of the runway: invisible, but not 'touching'
+      S.pR = 0; S.rR = -dHdg; S.alphaDot = 0;              // realistic model: rates carried into the air
+      S.vAir.copy(S.vel).sub(windVel);
+      showMsg('Airborne!', 1.5);
+    }
+    return;
+  }
+
+  // ---- airborne ----
+  if (flightModel === 'realistic') airRealistic(dt);
+  else airStandard(dt, drag);
 
   const gh = groundHeight(S.pos.x, S.pos.z);
   if (S.pos.y - GEAR <= Math.max(gh, 0)) {
@@ -1417,6 +1574,7 @@ function step(dt) {
     if (vs > -7 && Math.abs(roll) < 0.35 && pitch > -0.12 && pitch < 0.35) {
       S.grounded = true; S.stalling = false; S.heading = _e.y; S.gPitch = Math.max(0, pitch);
       S.tPitch = tPitch; S.tRoll = tRoll;
+      S.pR = S.rR = 0; S.qR = 0;
       S.pos.y = gh + GEAR;
       _h.set(-Math.sin(S.heading), 0, -Math.cos(S.heading));
       right.set(Math.cos(S.heading), 0, -Math.sin(S.heading));
@@ -1536,7 +1694,7 @@ function updateHud(dt) {
   const gh = Math.max(groundHeight(S.pos.x, S.pos.z), 0);
   const agl = S.pos.y - GEAR - gh;
   // everything else lives on the GPS unit and the instrument panel; only unusual modes show here
-  const flags = [invert && 'PITCH INVERTED', audio.muted && 'SOUND OFF'].filter(Boolean);
+  const flags = [flightModel === 'realistic' && 'REALISTIC FM', invert && 'PITCH INVERTED', audio.muted && 'SOUND OFF'].filter(Boolean);
   const fpsCol = fps.value >= 50 ? '' : fps.value >= 30 ? ' style="color:#ffd27a"' : ' style="color:#ff6a5a"';
   const flagTxt = (fps.show ? `<span class="fps"${fpsCol}>${fps.value.toFixed(0)} FPS · ${fps.ms.toFixed(1)} ms</span>` : '') +
     flags.map((f) => `<span>${f}</span>`).join('');
@@ -2427,6 +2585,8 @@ function renderBinds() {
   $('setBinds').innerHTML = html;
 }
 function fillSettings() {
+  $('setFM').value = flightModel;
+  $('setFMNote').textContent = FM_NOTES[flightModel];
   $('setInvert').checked = invert;
   $('setSens').value = MOUSE_SENS;
   $('setFov').value = camera.fov; $('setFovVal').textContent = `${camera.fov}°`;
@@ -2453,6 +2613,11 @@ function toggleSettings(open = setEl.style.display !== 'block') {
     fillSettings();
   } else if (!pausedBeforeSettings) setPaused(false);
 }
+const FM_NOTES = {
+  standard: 'Idealised and forgiving: the nose holds the trimmed attitude, turns are clean, stalls are gentle.',
+  realistic: 'Forces and moments on a Cessna-172-class airframe: adverse yaw, torque / P-factor (right rudder on takeoff), a real phugoid, wing drop at the stall, spins. Fly it with trim and small inputs.',
+};
+$('setFM').addEventListener('change', (e) => { setFlightModel(e.target.value); $('setFMNote').textContent = FM_NOTES[flightModel]; });
 $('setInvert').addEventListener('change', (e) => { invert = e.target.checked; });
 $('setSens').addEventListener('input', (e) => { MOUSE_SENS = +e.target.value; });
 $('setFov').addEventListener('input', (e) => {
@@ -2488,7 +2653,7 @@ $('setBinds').addEventListener('click', (e) => {
 const PREFS_KEY = 'xsim-flightsim-prefs-v1';
 function savePrefs() {
   const prefs = {
-    binds, invert, mouseSens: MOUSE_SENS, fov: camera.fov, help: helpEl.style.display !== 'none', fps: fps.show,
+    binds, flightModel, invert, mouseSens: MOUSE_SENS, fov: camera.fov, help: helpEl.style.display !== 'none', fps: fps.show,
     panel: showPanel, mapMode, renderScale: settings.renderScale, shadows: settings.shadows, muted: audio.muted, volume: audio.volume,
   };
   try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* storage unavailable */ }
@@ -2504,6 +2669,7 @@ function loadPrefs() {
       if (Array.isArray(b)) binds[id] = [0, 1].map((i) => (typeof b[i] === 'string' && b[i] && !b[i].endsWith('Escape') ? b[i] : null));
     }
   }
+  if (p.flightModel === 'standard' || p.flightModel === 'realistic') setFlightModel(p.flightModel);
   invert = !!p.invert;
   MOUSE_SENS = num(p.mouseSens, 0.002, 0.016, MOUSE_SENS);
   camera.fov = num(p.fov, 45, 95, camera.fov); camera.updateProjectionMatrix();
@@ -2525,7 +2691,7 @@ setEl.addEventListener('input', savePrefs);
 $('setResetAll').addEventListener('click', () => {
   try { localStorage.removeItem(PREFS_KEY); } catch { /* storage unavailable */ }
   binds = defaultBinds(); capture = null;
-  invert = false; MOUSE_SENS = 0.006;
+  setFlightModel('standard'); invert = false; MOUSE_SENS = 0.006;
   camera.fov = 65; camera.updateProjectionMatrix(); updateLightScale();
   helpEl.style.display = ''; fps.show = true; setPanelVisible(true);
   mapMode = 0; applyMapMode();

@@ -110,6 +110,10 @@
   <h3>SETTINGS</h3>
   <div style="font-size:12px;color:#fffa">Changes apply immediately. The sim is paused while this is open.</div>
   <h4>General</h4>
+  <label class="opt">Flight model
+    <select id="setFM"><option value="standard">Standard (forgiving)</option><option value="realistic">Realistic (6-DOF)</option></select>
+  </label>
+  <div id="setFMNote" style="font-size:11px;color:#fff9;margin:-2px 0 6px"></div>
   <label class="opt">Invert pitch (W = nose up) <input id="setInvert" type="checkbox"></label>
   <label class="opt">Mouse look sensitivity <input id="setSens" type="range" min="0.002" max="0.016" step="0.001"></label>
   <label class="opt">Field of view <span><input id="setFov" type="range" min="45" max="95" step="1"> <span id="setFovVal"></span></span></label>

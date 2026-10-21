@@ -4,6 +4,9 @@ A small single-engine flight simulator built on [three.js](https://threejs.org/)
 in `vendor/`). No build step and no server: open `index.html` in a browser and click
 **Click to fly**. Works offline.
 
+**Play it online:** https://denzy7.github.io/test-threejs/ (GitHub Pages, deployed from `main` on
+every push). Settings saved there are separate from a copy opened from disk.
+
 ## Flying
 
 - **Take off:** full power (`R`), let it accelerate down runway 36 — at the takeoff trim it lifts off

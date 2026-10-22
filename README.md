@@ -41,7 +41,16 @@ in your browser (localStorage) only.
 | `U`, `H`, `K` | instrument panel, help, FPS counter |
 | `X`, `N` | weather panel, day / dusk / night |
 | `T`, `Y`, `P` | reset on runway, air start on approach, pause |
+| `Z` | replay |
 | `O`, `I` | sound, invert pitch |
+
+## Replay
+
+`Z` replays the last 10 minutes of flight, starting 30 s back. Every camera view,
+instrument and the map work as normal during playback. `Space` plays / pauses, `←` / `→` seek 5 s
+(30 s with `Shift`), `↑` / `↓` change speed (¼× to 4×), `Home` / `End` jump to either end, or drag
+the scrubber. `Esc` or `Z` returns to where you were; `Enter` (**Take control**) drops everything
+after the moment on screen and lets you fly on from there, which is handy for retrying a landing.
 
 ## What's in it
 

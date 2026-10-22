@@ -51,6 +51,12 @@
   #settings .row { display: flex; gap: 8px; margin-top: 14px; }
   #settings .row button { flex: 1; padding: 6px; }
   #setNote { min-height: 16px; color: #ffd27a; font-size: 12px; margin-top: 6px; }
+  #replay { position: fixed; top: 80px; left: 16px; z-index: 4; display: none; align-items: center; gap: 6px; flex-wrap: wrap; width: min(680px, calc(100vw - 32px)); box-sizing: border-box; background: #15181ce8; color: #e8f0e8; border: 1px solid #fff4; border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+  #replay .tag { color: #ff6a5a; font-weight: bold; letter-spacing: 1px; }
+  #replay button { font: inherit; background: #252a30; color: #e8f0e8; border: 1px solid #fff3; border-radius: 5px; padding: 3px 8px; cursor: pointer; min-width: 32px; }
+  #replay button:hover { background: #333a42; }
+  #rpSeek { flex: 1 1 120px; min-width: 0; }
+  #rpTime { min-width: 92px; text-align: center; color: #9fe89f; }
   #wxMetar { margin-top: 12px; padding: 6px 8px; background: #000a; border-radius: 5px; color: #9fe89f; font-size: 12px; word-break: break-all; }
 </style>
 </head>
@@ -63,6 +69,17 @@
 <div id="warn" class="hud"></div>
 <div id="msg" class="hud"></div>
 <div id="help" class="hud"></div>
+<div id="replay">
+  <span class="tag">● REPLAY</span>
+  <button id="rpBack" title="Back 5 s (←, Shift+← 30 s)">⏪</button>
+  <button id="rpPlay" title="Play / pause (Space)">❚❚</button>
+  <button id="rpFwd" title="Forward 5 s (→, Shift+→ 30 s)">⏩</button>
+  <input id="rpSeek" type="range" min="0" max="1" step="0.001" title="Scrub (Home / End)">
+  <span id="rpTime">0:00 / 0:00</span>
+  <button id="rpSpeed" title="Playback speed (↑ / ↓)">1×</button>
+  <button id="rpTake" title="Fly on from this moment (Enter)">Take control</button>
+  <button id="rpExit" title="Back to live (Esc)">✕</button>
+</div>
 
 <div id="wx">
   <h3>WEATHER</h3>

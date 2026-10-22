@@ -1163,6 +1163,7 @@ const ACTIONS = [
   ['resetRunway', 'Reset on runway', 'Sim', ['KeyT']],
   ['airStart', 'Air start on approach', 'Sim', ['KeyY']],
   ['pause', 'Pause', 'Sim', ['KeyP']],
+  ['replay', 'Replay (last 10 min)', 'Sim', ['KeyZ']],
   ['timeOfDay', 'Day / dusk / night', 'Sim', ['KeyN']],
   ['weather', 'Weather panel', 'Sim', ['KeyX']],
   ['sound', 'Sound on / off', 'Sim', ['KeyO']],
@@ -1183,7 +1184,9 @@ let chaseDist = 14, turnRate = 0, prevHdg = 0;
 const $ = (id) => document.getElementById(id);
 function showMsg(text, secs = 2.5) { $('msg').textContent = text; msgTimer = secs; }
 
+let replayCut = true; // set by reset(): the next replay sample follows a teleport, so don't blend into it
 function reset(air) {
+  replayCut = true;
   S.crashed = false; S.heading = 0; S.gPitch = 0; S.stalling = false; S.gs = 0; S.beta = 0; S.gamma = 0; S.vDot = 0; S.trim = TRIM_TO; S.q = 0; S.r = 0; S.rRud = 0; S.pDih = 0; S.pR = S.qR = S.rR = 0; S.alphaDot = 0; S.tPitch = 0; S.tRoll = 0; S.gRoll = 0; S.gSide = 0;
   S.gearDown = true; S.gearPos = 1;
   S.baro = weather.qnh; // as if you'd just listened to the ATIS
@@ -1220,6 +1223,15 @@ function crash(reason) {
   fire.visible = smoke.visible = true;
   playSound('crash');
   showMsg(`CRASHED — ${reason}. Press T`, 1e9);
+}
+// fireball and smoke, t seconds after the crash
+function crashFx(t) {
+  fire.scale.setScalar(2 + Math.min(t, 1) * 22);
+  fire.material.opacity = Math.max(0, 1 - t / 1.6);
+  fire.visible = fire.material.opacity > 0;
+  smoke.scale.setScalar(4 + t * 10);
+  smoke.position.y = S.pos.y + t * 8;
+  smoke.material.opacity = Math.max(0, 0.75 - t / 8);
 }
 
 const _v = new THREE.Vector3(), _h = new THREE.Vector3(), _q = new THREE.Quaternion(), _e = new THREE.Euler();
@@ -1426,13 +1438,7 @@ function step(dt) {
 
   if (S.crashed) {
     S.crashT += dt;
-    const t = S.crashT;
-    fire.scale.setScalar(2 + Math.min(t, 1) * 22);
-    fire.material.opacity = Math.max(0, 1 - t / 1.6);
-    fire.visible = fire.material.opacity > 0;
-    smoke.scale.setScalar(4 + t * 10);
-    smoke.position.y = S.pos.y + t * 8;
-    smoke.material.opacity = Math.max(0, 0.75 - t / 8);
+    crashFx(S.crashT);
     return;
   }
 
@@ -2534,9 +2540,188 @@ const RUN = {
   sound: () => setMuted(!audio.muted),
   invert: () => { invert = !invert; showMsg(invert ? `Pitch inverted (${keyName(binds.pitchDown[0])} = nose up)` : `Pitch normal (${keyName(binds.pitchDown[0])} = nose down)`, 1.5); },
   pause: () => setPaused(!paused),
+  replay: () => enterReplay(),
   help: () => { helpEl.style.display = helpEl.style.display === 'none' ? '' : 'none'; },
   settings: () => toggleSettings(),
 };
+
+// ---------- replay ----------
+// The last REC_SECS of flight are sampled REC_HZ times a second into one ring buffer: every number,
+// flag, vector and quaternion in S, plus the controls and a few globals. Playback writes blended
+// samples back into S, so the plane, instruments, warnings, sound and camera all work unchanged.
+// "Take control" drops everything after the sample on screen and resumes the live sim from it.
+const REC_HZ = 20, REC_SECS = 600, REC_MAX = REC_HZ * REC_SECS;
+const recLayout = []; // { k, kind: 'n' number | 'b' flag | 'v' Vector3 | 'q' Quaternion, o: offset }
+let REC_N = 0;
+for (const [k, v] of Object.entries(S)) {
+  const kind = typeof v === 'number' ? 'n' : typeof v === 'boolean' ? 'b' : v?.isVector3 ? 'v' : v?.isQuaternion ? 'q' : null;
+  if (kind) { recLayout.push({ k, kind, o: REC_N }); REC_N += kind === 'v' ? 3 : kind === 'q' ? 4 : 1; }
+}
+// extras after S: time, cut, ctl pitch/roll/yaw, simTime, turnRate, navIdx, flight model, 4 lights
+const RX = REC_N; REC_N += 13;
+const recBuf = new Float64Array(REC_MAX * REC_N);
+const rec = { head: 0, count: 0, acc: 0, t: 0 }; // head: next slot to write; t: recording clock, s
+const LIGHT_KEYS = ['landing', 'taxi', 'nav', 'strobe'];
+const recOff = (i) => ((rec.head - rec.count + i + REC_MAX) % REC_MAX) * REC_N; // i = 0: oldest sample
+const recTime = (i) => recBuf[recOff(i) + RX];
+
+function recWrite(b, o, cut) {
+  for (const { k, kind, o: f } of recLayout) {
+    const v = S[k];
+    if (kind === 'n') b[o + f] = v;
+    else if (kind === 'b') b[o + f] = v ? 1 : 0;
+    else { b[o + f] = v.x; b[o + f + 1] = v.y; b[o + f + 2] = v.z; if (kind === 'q') b[o + f + 3] = v.w; }
+  }
+  const x = o + RX;
+  b[x] = rec.t; b[x + 1] = cut ? 1 : 0;
+  b[x + 2] = ctl.pitch; b[x + 3] = ctl.roll; b[x + 4] = ctl.yaw;
+  b[x + 5] = simTime; b[x + 6] = turnRate; b[x + 7] = navIdx; b[x + 8] = flightModel === 'realistic' ? 1 : 0;
+  LIGHT_KEYS.forEach((l, j) => { b[x + 9 + j] = lightsOn[l] ? 1 : 0; });
+}
+// write the state f of the way from sample a to sample c (offsets into b) back into the sim
+const _qa = new THREE.Quaternion(), _qc = new THREE.Quaternion();
+function recApply(b, a, c, f) {
+  if (b[c + RX + 1]) f = 0; // a reset happened in between: no sliding across the field
+  const L = (j) => b[a + j] + (b[c + j] - b[a + j]) * f;
+  const near = f < 0.5 ? a : c; // flags and discrete values come from the nearer sample
+  setFlightModel(b[near + RX + 8] ? 'realistic' : 'standard'); // first: it touches the body rates
+  for (const { k, kind, o: j } of recLayout) {
+    if (kind === 'n') S[k] = k === 'heading' ? b[a + j] + wrapAngle(b[c + j] - b[a + j]) * f : L(j);
+    else if (kind === 'b') S[k] = b[near + j] === 1;
+    else if (kind === 'v') S[k].set(L(j), L(j + 1), L(j + 2));
+    else S[k].slerpQuaternions(_qa.fromArray(b, a + j), _qc.fromArray(b, c + j), f);
+  }
+  const x = RX;
+  ctl.pitch = L(x + 2); ctl.roll = L(x + 3); ctl.yaw = L(x + 4);
+  simTime = L(x + 5); turnRate = L(x + 6); navIdx = b[near + x + 7];
+  LIGHT_KEYS.forEach((l, j) => { lightsOn[l] = b[near + x + 9 + j] === 1; });
+  // the wreck: plane hidden, fire and smoke as far along as S.crashT says
+  plane.g.visible = !S.crashed;
+  if (S.crashed) {
+    fire.position.copy(S.pos); smoke.position.copy(S.pos);
+    fire.visible = smoke.visible = true;
+    crashFx(S.crashT);
+  } else fire.visible = smoke.visible = false;
+}
+
+function recordTick(dt) {
+  rec.t += dt;
+  if (S.crashed && S.crashT > 6) return; // enough of the wreck burning
+  rec.acc += dt;
+  if (rec.acc < 1 / REC_HZ && !replayCut) return;
+  rec.acc %= 1 / REC_HZ;
+  recWrite(recBuf, rec.head * REC_N, replayCut);
+  replayCut = false;
+  rec.head = (rec.head + 1) % REC_MAX;
+  rec.count = Math.min(rec.count + 1, REC_MAX);
+}
+
+// playback
+const RP_SPEEDS = [0.25, 0.5, 1, 2, 4];
+const rp = { on: false, time: 0, playing: true, speed: 2, live: new Float64Array(REC_N), msg: '', msgT: 0, seeking: false };
+const rpEl = $('replay'), rpSeek = $('rpSeek');
+const fmtClock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+function enterReplay() {
+  if (rec.count < 2) { showMsg('Nothing recorded yet', 1.5); return; }
+  recWrite(rp.live, 0, false); // where to come back to
+  rp.msg = $('msg').textContent; rp.msgT = msgTimer; showMsg('', 0);
+  rp.on = true;
+  rp.time = Math.max(recTime(0), recTime(rec.count - 1) - 30); // the last 30 s, to start with
+  setReplayPlaying(true);
+  rpEl.style.display = 'flex';
+  snapCam = true;
+  replayTick(0);
+}
+function exitReplay(takeControl) {
+  if (!rp.on) return;
+  rp.on = false;
+  rpEl.style.display = 'none';
+  audio.ctx?.resume();
+  if (takeControl) {
+    // forget the future: the recording carries on from the sample on screen
+    const i = replayIndex();
+    rec.head = (rec.head - rec.count + i + 1 + REC_MAX) % REC_MAX;
+    rec.count = i + 1; rec.t = recTime(i); rec.acc = 0;
+    showMsg(S.crashed ? 'Crashed — press T' : 'You have control', S.crashed ? 1e9 : 1.5);
+  } else {
+    recApply(rp.live, 0, 0, 0);
+    showMsg(rp.msg, rp.msgT);
+  }
+  prevHdg = headingRad();
+  snapCam = true;
+}
+function setReplayPlaying(p) {
+  rp.playing = p;
+  $('rpPlay').textContent = p ? '❚❚' : '▶';
+  if (p) audio.ctx?.resume(); else audio.ctx?.suspend(); // freeze-frame is silent
+}
+// the last sample at or before rp.time
+function replayIndex() {
+  let lo = 0, hi = rec.count - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (recTime(mid) <= rp.time) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+function replaySeek(t) {
+  rp.time = clamp(t, recTime(0), recTime(rec.count - 1));
+  replayTick(0);
+}
+function replayTick(dt) {
+  const t0 = recTime(0), t1 = recTime(rec.count - 1);
+  const play = rp.playing ? dt * RP_SPEEDS[rp.speed] : 0;
+  rp.time += play;
+  if (rp.time >= t1) { rp.time = t1; if (rp.playing) setReplayPlaying(false); }
+  const i = replayIndex(), j = Math.min(i + 1, rec.count - 1);
+  const ta = recTime(i), tc = recTime(j);
+  recApply(recBuf, recOff(i), recOff(j), tc > ta ? clamp((rp.time - ta) / (tc - ta), 0, 1) : 0);
+  animatePlane(play);
+  if (!rp.seeking) rpSeek.value = t1 > t0 ? (rp.time - t0) / (t1 - t0) : 1;
+  $('rpTime').textContent = `${fmtClock(rp.time - t0)} / ${fmtClock(t1 - t0)}`;
+  $('rpSpeed').textContent = `${RP_SPEEDS[rp.speed]}×`;
+}
+function togglePlay() {
+  if (!rp.playing && rp.time >= recTime(rec.count - 1)) replaySeek(-Infinity); // at the end: from the top
+  setReplayPlaying(!rp.playing);
+}
+const changeSpeed = (d) => { rp.speed = clamp(rp.speed + d, 0, RP_SPEEDS.length - 1); replayTick(0); };
+// keys while replaying: transport controls, plus the view actions; nothing that flies the plane
+const RP_VIEW = ['camera', 'recenter', 'panel', 'map', 'help', 'fps', 'gpsIn', 'gpsOut', 'sound', 'timeOfDay', 'settings'];
+function replayKey(e) {
+  const id = findAction(comboOf(e));
+  const k = e.code;
+  if (k === 'Escape' || id === 'replay') exitReplay(false);
+  else if (k === 'Enter') exitReplay(true);
+  else if (k === 'Space' || id === 'pause') togglePlay();
+  else if (k === 'ArrowLeft') replaySeek(rp.time - (e.shiftKey ? 30 : 5));
+  else if (k === 'ArrowRight') replaySeek(rp.time + (e.shiftKey ? 30 : 5));
+  else if (k === 'ArrowUp') changeSpeed(1);
+  else if (k === 'ArrowDown') changeSpeed(-1);
+  else if (k === 'Home') replaySeek(-Infinity);
+  else if (k === 'End') replaySeek(Infinity);
+  else {
+    if (id && RP_VIEW.includes(id) && !e.repeat) { e.preventDefault(); RUN[id](); }
+    return;
+  }
+  e.preventDefault();
+}
+// buttons drop focus after a click so Space / arrows keep driving the replay, not the button
+const rpBtn = (id, fn) => $(id).addEventListener('click', (e) => { e.currentTarget.blur(); fn(); });
+rpBtn('rpBack', () => replaySeek(rp.time - 5));
+rpBtn('rpFwd', () => replaySeek(rp.time + 5));
+rpBtn('rpPlay', togglePlay);
+rpBtn('rpSpeed', () => changeSpeed(rp.speed === RP_SPEEDS.length - 1 ? -rp.speed : 1)); // cycles
+rpBtn('rpTake', () => exitReplay(true));
+rpBtn('rpExit', () => exitReplay(false));
+rpSeek.addEventListener('pointerdown', () => { rp.seeking = true; });
+rpSeek.addEventListener('input', () => {
+  const t0 = recTime(0);
+  replaySeek(t0 + rpSeek.value * (recTime(rec.count - 1) - t0));
+});
+const endSeek = () => { rp.seeking = false; rpSeek.blur(); };
+rpSeek.addEventListener('pointerup', endSeek);
+rpSeek.addEventListener('change', endSeek);
 
 // ---------- help (built from the current bindings) ----------
 const helpEl = $('help');
@@ -2550,7 +2735,7 @@ function renderHelp() {
     `${k('landingLight')} landing light &nbsp; ${k('taxiLight')} taxi light &nbsp; ${k('navLights')} nav + beacon &nbsp; ${k('strobes')} strobes`,
     `<kbd>Drag</kbd> look around &nbsp; <kbd>Wheel</kbd> zoom &nbsp; ${k('recenter')} recenter &nbsp; ${k('camera')} camera`,
     `${k('panel')} instruments &nbsp; ${k('weather')} weather &nbsp; ${k('map')} map / GPS &nbsp; ${k('gpsOut', 'gpsIn')} GPS range &nbsp; ${k('sound')} sound`,
-    `${k('resetRunway')} reset on runway &nbsp; ${k('airStart')} air start (on approach)`,
+    `${k('resetRunway')} reset on runway &nbsp; ${k('airStart')} air start (on approach) &nbsp; ${k('replay')} replay`,
     `${k('ils')} tune next NAV (ILS / VOR) &nbsp; ${k('obsDown', 'obsUp')} VOR course −/+`,
     'Big map: wheel zoom, drag to pan, double-click to reset, click a VOR or the ILS feather to tune it',
     `${k('invert')} invert pitch &nbsp; ${k('pause')} pause &nbsp; ${k('fps')} FPS &nbsp; ${k('help')} hide help &nbsp; <kbd>Esc</kbd> settings`,
@@ -2739,6 +2924,7 @@ addEventListener('keydown', (e) => {
   }
   keys[e.code] = true;
   if (!isModifier(e.code)) { initAudio(); dismissStart(); }
+  if (rp.on) { replayKey(e); return; }
   if (e.code === 'Escape') { e.preventDefault(); if (!e.repeat) toggleSettings(true); return; } // always available
   const combo = comboOf(e);
   // exact combo first; with modifiers held, fall back to the bare key unless that combo is unbound
@@ -2773,7 +2959,8 @@ renderer.setAnimationLoop(() => {
   const rawDt = clock.getDelta(), dt = Math.min(rawDt, 0.05);
   fps.frames++; fps.time += rawDt;
   if (fps.time >= 0.5) { fps.value = fps.frames / fps.time; fps.ms = fps.time * 1000 / fps.frames; fps.frames = 0; fps.time = 0; }
-  if (!paused) {
+  if (paused) { /* frozen */ } else if (rp.on) replayTick(dt);
+  else {
     const sub = 4;
     for (let i = 0; i < sub; i++) step(dt / sub);
     animatePlane(dt);
@@ -2782,6 +2969,7 @@ renderer.setAnimationLoop(() => {
     dh = Math.atan2(Math.sin(dh), Math.cos(dh));
     prevHdg = hdg;
     if (dt > 0) turnRate = damp(turnRate, dh / dt / D2R, 4, dt);
+    recordTick(dt);
   }
   updateCamera(dt);
   updateWeatherVisuals();
